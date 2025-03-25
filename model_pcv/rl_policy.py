@@ -75,7 +75,7 @@ class PointCloudRLPolicy(nn.Module):
         self.returns_dq = deque([torch.zeros((1, 0, plm_embed_size), device=device)], maxlen=max_length)
         self.tile_selections_dq = deque([torch.zeros((1, 0, plm_embed_size), device=device)], maxlen=max_length)
         self.qualities_dq = deque([torch.zeros((1, 0, plm_embed_size), device=device)], maxlen=max_length)
-
+        
         self.residual = residual
         self.which_layer = which_layer
         
@@ -186,6 +186,48 @@ class PointCloudRLPolicy(nn.Module):
             selected_tile: 选择的tile
             selected_quality: 选择的质量级别
         """
+        # # 根据是否处于训练模式决定是否执行探索
+        exploration_mode = self.training
+        
+        # 衰减的epsilon值 - 随时间减少探索
+        epsilon = max(0.05, 0.5 * (0.99 ** timestep)) if exploration_mode else 0.0
+        
+        # 以epsilon的概率随机探索
+        if random.random() < epsilon:
+            # 随机选择tile (平均选择8-10个tile)
+            random_tile_prob = 8.0 / self.tile_num  # 平均选中8个tile的概率
+            selected_tile = (np.random.random(self.tile_num) < random_tile_prob).astype(float)
+            
+            # 确保至少选择了6个tile
+            if np.sum(selected_tile) < 6:
+                indices = np.random.choice(
+                    np.where(selected_tile == 0)[0], 
+                    size=6-int(np.sum(selected_tile)), 
+                    replace=False
+                )
+                selected_tile[indices] = 1.0
+            
+            # 随机选择质量级别，倾向于中等质量
+            # 使用截断正态分布，均值在中等质量级别，确保在[0, quality_levels-1]范围内
+            mean_quality = (self.quality_levels - 1) / 2
+            std_dev = self.quality_levels / 4
+            
+            selected_quality = np.zeros(self.tile_num, dtype=int)
+            for i in range(self.tile_num):
+                if selected_tile[i] > 0.1:
+                    # 生成正态分布随机值并截断到有效范围
+                    q = int(np.clip(np.random.normal(mean_quality, std_dev), 0, self.quality_levels-1))
+                    selected_quality[i] = q
+            
+            # 记录探索行为
+            #self.logger.info(f"[探索] 随机选择了 {np.sum(selected_tile)} 个tile，平均质量级别: {np.mean(selected_quality[selected_tile > 0.1]):.2f}")
+            
+            # 计算动作嵌入并更新历史队列
+            self._update_action_history(selected_tile, selected_quality, target_return, timestep)
+            
+            return selected_tile, selected_quality
+        
+        
         # 堆叠之前的状态、动作、回报特征
         prev_stacked_inputs = []
         for i in range(len(self.states_dq)):
@@ -250,15 +292,15 @@ class PointCloudRLPolicy(nn.Module):
         
         # 应用sigmoid到tile选择预测
         tile_probs = torch.sigmoid(tile_selection_pred).squeeze(0).squeeze(0)
-        #self.logger.info(f"tile_probs: {tile_probs}")
-        # 增加探索 - 在训练阶段添加随机性
-        # if self.training:
-        #     exploration_prob = 0.2  # 20% 的随机探索概率
-        #     random_mask = torch.rand(tile_probs.size()) < exploration_prob
-        #     random_values = torch.rand(tile_probs.size())
-        #     tile_probs = torch.where(random_mask.to(self.device), random_values.to(self.device), tile_probs)
+        #self.logger.info(f"噪声前tile probs:{tile_probs.shape}")
+        # 添加少量噪声以避免完全确定性行为
+        if exploration_mode:
+            noise_level = 0.1 * (0.99 ** timestep)  # 随时间减少噪声
+            tile_probs = tile_probs + noise_level * torch.rand_like(tile_probs)
+        tile_probs=tile_probs.squeeze(0)
+        #self.logger.info(f"噪声后tile probs:{tile_probs.shape}")
         selected_tile = (tile_probs > 0.3).float().cpu().numpy()
-        #self.logger.info(f"after explore tile_probs: {tile_probs}")
+        
         # 确保至少选择8个tile
         selected_count = np.sum(selected_tile)
         if selected_count < 8:
@@ -273,32 +315,87 @@ class PointCloudRLPolicy(nn.Module):
         # 为每个选中的tile选择质量级别
         quality_probs = F.softmax(quality_pred.squeeze(0), dim=1).cpu().numpy()
         selected_quality = np.zeros(self.tile_num, dtype=int)
-        
+        # self.logger.info(f"Type of quality_probs: {type(quality_probs)}, Type of quality_probs[i]: {type(quality_probs[i])}")
         for i in range(self.tile_num):
             if selected_tile[i] > 0.1:  # 如果tile被选中 
+                # if exploration_mode:
+                #     # 在训练模式下添加一些随机性
+                #     # 使用temperature参数来控制分布的随机性
+                #     temperature = max(0.5, 1.0 * (0.99 ** timestep))  # 随时间降低温度（减少随机性）
+                #     adjusted_probs = np.power(quality_probs[i], 1.0/temperature)
+                #     adjusted_probs = adjusted_probs / np.sum(adjusted_probs)  # 重新归一化
+                #     selected_quality[i] = np.random.choice(self.quality_levels, p=adjusted_probs)
+                # else:
+                #     # 评估模式下选择最高概率的质量
+                #     selected_quality[i] = np.argmax(quality_probs[i])
+        
                 selected_quality[i] = np.argmax(quality_probs[i])
-        #self.logger.info(f"selected_tile: {selected_tile}")
-        #self.logger.info(f"selected_quality: {selected_quality}")
-        # 计算动作嵌入
+
+        # 计算动作嵌入并更新历史
+        self._update_action_history(selected_tile, selected_quality, target_return, timestep)
+    
+        # # 计算动作嵌入
+        # tile_tensor = torch.as_tensor(selected_tile, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)
+        # quality_tensor = torch.zeros(1, 1, self.tile_num, dtype=torch.float32, device=self.device)
+        # for i in range(self.tile_num):
+        #     if selected_tile[i] > 0.1:
+        #         quality_tensor[0, 0, i] = selected_quality[i] / (self.quality_levels - 1)
+        
+        # # 嵌入动作
+        # tile_embeddings = self.embed_tile_selection(tile_tensor) + time_embeddings
+        # quality_embeddings = self.embed_quality(quality_tensor) + time_embeddings
+        
+        # # 更新队列
+        # self.returns_dq.append(return_embeddings)
+        # self.states_dq.append(state_embeddings)
+        # self.tile_selections_dq.append(tile_embeddings)
+        # self.qualities_dq.append(quality_embeddings)
+        # #self.logger.info(f"selected_tile: {selected_tile}")
+        # #self.logger.info(f"selected_quality: {selected_quality}")
+        return selected_tile, selected_quality
+    
+    def _update_action_history(self, selected_tile, selected_quality, target_return, timestep):
+        """
+        计算动作嵌入并更新历史队列
+        
+        参数:
+            selected_tile: 选择的tile
+            selected_quality: 选择的质量级别
+            target_return: 目标回报
+            timestep: 当前时间步
+        """
+        # 将动作转换为张量
         tile_tensor = torch.as_tensor(selected_tile, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)
+        
+        # 对质量进行归一化
         quality_tensor = torch.zeros(1, 1, self.tile_num, dtype=torch.float32, device=self.device)
         for i in range(self.tile_num):
             if selected_tile[i] > 0.1:
                 quality_tensor[0, 0, i] = selected_quality[i] / (self.quality_levels - 1)
         
+        # 获取时间嵌入
+        time_embeddings = self.embed_timestep(
+            torch.as_tensor(timestep, dtype=torch.int32, device=self.device).reshape(1, 1)
+        )
+        
         # 嵌入动作
         tile_embeddings = self.embed_tile_selection(tile_tensor) + time_embeddings
         quality_embeddings = self.embed_quality(quality_tensor) + time_embeddings
+        
+        # 嵌入目标回报
+        return_embeddings = self.embed_return(
+            torch.as_tensor(target_return, dtype=torch.float32, device=self.device).reshape(1, 1, 1)
+        ) + time_embeddings
+        
+        # 处理状态（假设当前状态已经在前面的代码中处理过）
+        state_embeddings = self.states_dq[-1] if self.states_dq else time_embeddings
         
         # 更新队列
         self.returns_dq.append(return_embeddings)
         self.states_dq.append(state_embeddings)
         self.tile_selections_dq.append(tile_embeddings)
         self.qualities_dq.append(quality_embeddings)
-        #self.logger.info(f"selected_tile: {selected_tile}")
-        #self.logger.info(f"selected_quality: {selected_quality}")
-        return selected_tile, selected_quality
-    
+        
     def clear_dq(self):
         """清空双端队列并重新初始化"""
         self.states_dq.clear()

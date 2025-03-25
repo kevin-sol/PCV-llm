@@ -13,7 +13,7 @@ from model_pcv.low_rank import peft_model
 from model_pcv.Hyperparameters import TILE_IN_F,F_IN_GOF,QUALITY_LEVELS,VIDEO_GOF_LEN,\
     FRAME,INIT_QOE,REBUF_PENALTY,SMOOTH_PENALTY,MULTIPLE_QUALITY_LEVELS
 from utils.logger import setup_logger
-
+from model_pcv.PrioritizedBuffer import PrioritizedBuffer
 class LlamaPointCloudController:
     """使用Llama-2-7B控制点云流媒体系统"""
     
@@ -27,6 +27,10 @@ class LlamaPointCloudController:
             device: 运行设备
         """
         self.logger = setup_logger('train_logs')
+        
+        self.playback_pos=0
+        self.history_len=50
+        
         self.args = args
         self.env = env
         self.device = device
@@ -200,29 +204,32 @@ class LlamaPointCloudController:
         #return torch.FloatTensor(state).reshape(1, 1, -1)
         return torch.FloatTensor(state).unsqueeze(0)
     
-    def predict_fov_and_bitrate(self, current_frame, user_fov_trace):
+    def predict_fov_and_bitrate(self, current_frame, playback_pos,user_fov_trace):
         """
         使用Llama-2-7B预测FOV和比特率
         
         参数:
             current_frame: 当前帧索引
+            playback_position: 当前播放位置（已知FOV的最后一帧）
             user_fov_trace: 用户FOV轨迹
             
         返回:
             selected_tile: 选择的tile
             selected_quality: 选择的质量级别
         """
-        # 获取当前FOV并更新历史
-        for i in range(F_IN_GOF):
-            current_fov = user_fov_trace[current_frame+i] if current_frame+i < len(user_fov_trace) else user_fov_trace[-1]
-            self.update_fov_history(current_fov)
-        
-        # 如果历史数据不足，使用默认策略
-        if len(self.fov_history) < 30:  # 至少需要 30 帧历史
-            selected_tile = user_fov_trace[0]
-            selected_quality = [0] * TILE_IN_F
+        # 根据播放位置更新FOV历史（只使用已经播放过的帧的FOV）
+        self.fov_history = []  # 清空历史
+        for i in range(max(0, playback_pos - self.history_length), playback_pos):
+            if i < len(user_fov_trace):
+                self.fov_history.append(user_fov_trace[i])
+    
+        # 如果没有足够的历史FOV，使用默认策略
+        if len(self.fov_history) < 50:  # 至少需要50帧历史
+            selected_tile = np.ones(TILE_IN_F)  # 保守策略：选择所有tile
+            selected_quality = np.zeros(TILE_IN_F, dtype=int)  # 默认最低质量
             return selected_tile, selected_quality
-        # 预处理状态
+        
+        # 预处理当前状态（只基于已知的FOV历史）
         state = self.preprocess_state()
         #此时state的shape是[1,665]
 
@@ -275,9 +282,12 @@ class LlamaPointCloudController:
             rebuffer: 重缓冲时间
             quality: 平均质量
         """
+        self.playback_pos=int(self.env.playback_position)
+        # self.logger.info(f"播放位置：{self.playback_pos}")
         # 使用Llama-2-7B预测tile选择和质量级别
         selected_tile, selected_quality = self.predict_fov_and_bitrate(
             current_frame, 
+            self.playback_pos,
             user_fov_trace
         )
         # 记录预测结果
@@ -430,7 +440,7 @@ class LlamaPointCloudController:
         avg_switch = np.mean(all_switches)
         return avg_reward, avg_quality, avg_rebuffer,avg_switch
     
-    def train_step(self, states, actions, returns, timesteps):
+    def train_step(self, states, actions, returns, timesteps, weights=None, update_params=True):
         """
         执行一个训练步骤
         
@@ -439,12 +449,16 @@ class LlamaPointCloudController:
             actions: 动作批次（包含tile选择和质量级别）
             returns: 回报批次
             timesteps: 时间步批次
+            weights: 样本权重，用于优先级经验回放
+            update_params: 是否立即更新参数（用于梯度累积）
             
         返回:
             loss: 训练损失
+            td_errors: TD误差，用于优先级更新
         """
-        # 前向传播
-        self.optimizer.zero_grad()
+        # 确保批次大小为1
+        if update_params:
+            self.optimizer.zero_grad()
         
         # 从策略网络获取预测
         #self.logger.info(f"train-step shape:{states.shape}")
@@ -464,25 +478,55 @@ class LlamaPointCloudController:
             tile_selection_pred,
             tile_selection_true
         )
+        
+        # 如果提供了权重，应用于损失函数
+        if weights is not None:
+            tile_loss = tile_loss * weights.view(-1, 1, 1)
+        
+        # 取平均
+        tile_loss = tile_loss.mean()
+        
         batch_size, seq_len, _ = tile_selection_true.shape
         # quality_true形状是1，10，12 batchsize,seqlen,tile 归一化质量级别
         # quality_pred形状是10，12，4 seqlen,tile,quality 概率
         # 计算质量级别损失
         quality_loss = 0
         quality_samples = 0
+        quality_errors = []  # 存储每个样本的质量误差
+        for b in range(batch_size):
+            for s in range(seq_len):
+                for t in range(TILE_IN_F):
+                    if tile_selection_true[b, s, t] > 0.1:
+                        # 将归一化的质量值转换为类别索引
+                        target_quality = (quality_true[b, s, t] * (QUALITY_LEVELS- 1)).round().long()
+                        
+                        # 计算交叉熵损失
+                        sample_loss = F.cross_entropy(
+                            quality_pred[s, t].unsqueeze(0),
+                            target_quality.unsqueeze(0),
+                            reduction='none'
+                        )
+                        
+                        # 如果提供了权重，应用于损失
+                        if weights is not None:
+                            sample_loss = sample_loss * weights[b]
+                        
+                        quality_loss += sample_loss
+                        quality_samples += 1
+                        quality_errors.append(sample_loss.item())
 
-        for s in range(seq_len):
-            for t in range(TILE_IN_F):
-                if tile_selection_true[0, s, t] > 0.1:  # batch_size=1，所以用索引0
-                    # 将归一化的质量值转换为类别索引
-                    target_quality = (quality_true[0, s, t] * (QUALITY_LEVELS - 1)).round().long()
+        # for s in range(seq_len):
+        #     for t in range(TILE_IN_F):
+        #         if tile_selection_true[0, s, t] > 0.1:  # batch_size=1，所以用索引0
+        #             # 将归一化的质量值转换为类别索引
+        #             target_quality = (quality_true[0, s, t] * (QUALITY_LEVELS - 1)).round().long()
                     
-                    # quality_pred[s, t] 形状为 [4]，表示当前tile的质量级别预测概率
-                    quality_loss += F.cross_entropy(
-                        quality_pred[s, t].unsqueeze(0),  # 变为 [1, 4]
-                        target_quality.unsqueeze(0)       # 变为 [1]
-                    )
-                    quality_samples += 1
+        #             # quality_pred[s, t] 形状为 [4]，表示当前tile的质量级别预测概率
+        #             quality_loss += F.cross_entropy(
+        #                 quality_pred[s, t].unsqueeze(0),  # 变为 [1, 4]
+        #                 target_quality.unsqueeze(0)       # 变为 [1]
+        #             )
+        #             quality_samples += 1
 
         if quality_samples > 0:
             quality_loss = quality_loss / quality_samples
@@ -491,24 +535,29 @@ class LlamaPointCloudController:
             quality_loss = torch.tensor(0.0, device=tile_loss.device)
         # 总损失
         loss = tile_loss + quality_loss
+        # 计算TD误差（用于优先级更新）
+        with torch.no_grad():
+            # 简单地使用总损失作为TD误差的代理
+            td_errors = torch.abs(loss) * torch.ones(batch_size, device=loss.device)
         
         # 反向传播
-        loss.backward()
+        if update_params:
+            loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.policy.modules_except_plm.parameters(), 5.0)
+            
+            # 如果使用低秩适应，也裁剪这些参数
+            if self.args.rank != -1:
+                torch.nn.utils.clip_grad_norm_(self.plm.parameters(), 5.0)
+            
+            # 更新参数
+            self.optimizer.step()
         
-        # 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(self.policy.modules_except_plm.parameters(), 1.0)
-        
-        # 如果使用低秩适应，也裁剪这些参数
-        if self.args.rank != -1:
-            torch.nn.utils.clip_grad_norm_(self.plm.parameters(), 1.0)
-        
-        # 更新参数
-        self.optimizer.step()
-        
-        return loss.item()
+        return loss ,td_errors
     
     def train(self, fov_traces,dis_traces, num_episodes=3000, batch_size=1, report_interval=10, 
-          eval_interval=200, save_interval=200, model_dir=cfg.plm_ft_dir):
+          eval_interval=200, save_interval=200, model_dir=cfg.plm_ft_dir, gradient_accumulation_steps=4):
         """
         训练系统
         
@@ -544,15 +593,15 @@ class LlamaPointCloudController:
     }
         # 记录最佳模型性能
         best_eval_reward = float('-inf')
-    
-        # 经验缓冲区
-        buffer_exp = []
-        
+        # 使用优先级经验回放缓冲区
+        buffer_exp = PrioritizedBuffer(capacity=10000, alpha=0.6)
+        # 优化器步骤计数
+        optimization_step = 0
+
         for episode in range(num_episodes):
             
             # 随机选择一个FOV轨迹
             fov_trace_idx = np.random.randint(0, len(fov_traces))
-            #self.logger.info(f"选择 FOV 轨迹 {fov_trace_idx+1}")
             user_fov_trace = fov_traces[fov_trace_idx]
             user_dis_trace = dis_traces[fov_trace_idx]
             
@@ -577,9 +626,7 @@ class LlamaPointCloudController:
             # 模拟视频播放
             current_frame = 0
             gof_index = 0
-            
-            prev_quality=[0]*TILE_IN_F
-            
+                        
             while current_frame < len(self.video_size):
                 # 获取当前状态
                 state = self.preprocess_state()
@@ -603,6 +650,7 @@ class LlamaPointCloudController:
                 #     # 如果该 tile 被选择（例如 selected_tile[s] > 0.1 表示该 tile 有效）
                 #     switch_penalty+=SMOOTH_PENALTY *\
                 #         np.abs(MULTIPLE_QUALITY_LEVELS[max(buffer[current_frame//F_IN_GOF][s],0)]-MULTIPLE_QUALITY_LEVELS[prev_quality[s]])
+                
                 # 构造动作向量
                 # 将 selected_quality 转换为 NumPy 数组后再进行除法操作
                 action = np.concatenate([
@@ -631,7 +679,6 @@ class LlamaPointCloudController:
                 episode_reward.append(reward)
                 
                 # 更新当前帧和GOF索引
-                prev_quality = selected_quality
                 current_frame += F_IN_GOF
                 gof_index += 1
                 
@@ -640,34 +687,73 @@ class LlamaPointCloudController:
                     break
             
             # 收集本情节的经验到缓冲区
-            buffer_exp.append((
+            experience=(
                 torch.cat(episode_states, dim=0),
                 torch.tensor(episode_actions, dtype=torch.float32),
                 torch.tensor(episode_returns, dtype=torch.float32).unsqueeze(1),
                 torch.tensor(episode_timesteps, dtype=torch.int32)
-            ))
-            
+            )
+            # 使用平均回报作为初始优先级
+            initial_priority = abs(np.mean(episode_returns)) + 1e-5
+            buffer_exp.add(experience, initial_priority)
+        
             # 如果缓冲区足够大，进行训练
-            if len(buffer_exp) >= batch_size:
-                # 采样batch_size个情节
-                batch_indices = np.random.choice(len(buffer_exp), batch_size, replace=False)
-                batch = [buffer_exp[i] for i in batch_indices]
+            if buffer_exp.size >= batch_size:
+                 # 准备累积梯度更新的参数
+                self.optimizer.zero_grad()
+                accumulated_loss = 0.0
                 
-                # 解包批次
-                batch_states, batch_actions, batch_returns, batch_timesteps = zip(*batch)
-                # self.logger.info(f'batch_states.shape: {batch_states[0].shape},batch_size: {len(batch_states)}')
-                # self.logger.info(f"最终states形状: {states.shape}")
-
-                #执行训练步骤
-                loss = self.train_step(
-                    states=torch.stack(batch_states).to(self.device),
-                    actions=torch.stack(batch_actions).to(self.device),
-                    returns=torch.stack(batch_returns).to(self.device),
-                    timesteps=torch.stack(batch_timesteps).to(self.device)
-                )
-                
-                self.stats['losses'].append(loss)
-            
+                # 采样batch_size*gradient_accumulation_steps个样本
+                effective_batch_size = batch_size * gradient_accumulation_steps
+                if buffer_exp.size >= effective_batch_size:
+                    # 分批处理，每批batch_size个样本
+                    batch_samples, batch_indices, batch_weights = buffer_exp.sample(
+                        effective_batch_size, beta=0.4
+                    )
+                    
+                    # 将样本分成gradient_accumulation_steps批次
+                    for i in range(0, effective_batch_size, batch_size):
+                        end_idx = min(i + batch_size, effective_batch_size)
+                        mini_batch = batch_samples[i:end_idx]
+                        mini_batch_indices = batch_indices[i:end_idx]
+                        mini_batch_weights = batch_weights[i:end_idx]
+                        
+                        # 解包小批量
+                        batch_states, batch_actions, batch_returns, batch_timesteps = zip(*mini_batch)
+                        
+                        # 执行训练步骤但不更新参数
+                        loss, td_errors = self.train_step(
+                            states=torch.stack(batch_states).to(self.device),
+                            actions=torch.stack(batch_actions).to(self.device),
+                            returns=torch.stack(batch_returns).to(self.device),
+                            timesteps=torch.stack(batch_timesteps).to(self.device),
+                            weights=torch.tensor(mini_batch_weights, dtype=torch.float32).to(self.device),
+                            update_params=False  # 不立即更新参数
+                        )
+                        
+                        # 缩放损失以适应梯度累积
+                        scaled_loss = loss / gradient_accumulation_steps
+                        scaled_loss.backward()
+                        
+                        # 累积损失（用于日志记录）
+                        accumulated_loss += loss.item()
+                        
+                        # 更新样本优先级
+                        new_priorities = np.abs(td_errors.cpu().numpy()) + 1e-5
+                        buffer_exp.update_priorities(mini_batch_indices, new_priorities)
+                    
+                    # 完成梯度累积后更新参数
+                    # 梯度裁剪
+                    torch.nn.utils.clip_grad_norm_(self.policy.modules_except_plm.parameters(), 5.0)
+                    if self.args.rank != -1:
+                        torch.nn.utils.clip_grad_norm_(self.plm.parameters(), 5.0)
+                    
+                    self.optimizer.step()
+                    optimization_step += 1
+                    
+                    # 记录平均损失
+                    self.stats['losses'].append(accumulated_loss / gradient_accumulation_steps)
+                        
             # 记录情节统计
             # 平均每个gof的reward
             avg_reward = np.mean(episode_reward)

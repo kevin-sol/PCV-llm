@@ -52,7 +52,7 @@ def main():
     #parser.add_argument('--save_dir', type=str, default='./saved_models')
     
     # 训练参数
-    parser.add_argument('--num_episodes', type=int, default=3000)
+    parser.add_argument('--num_episodes', type=int, default=20000)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
@@ -67,7 +67,7 @@ def main():
     parser.add_argument('--max_length', type=int, help='用于控制历史记忆的长度',default=50)
     parser.add_argument('--max_ep_len', type=int, default=10)
     parser.add_argument('--which_layer', type=int, default=-1, help='提前停止的层')
-    
+    parser.add_argument('--accum_step', type=int, default=4, help='')
     # 语言模型参数.
     parser.add_argument('--plm_dir', type=str, default=cfg.plm_dir)
     parser.add_argument('--plm_type', type=str, default='llama')
@@ -144,7 +144,8 @@ def main():
             report_interval=args.report_interval,
             eval_interval=args.eval_interval, 
             save_interval=args.eval_interval, 
-            model_dir=cfg.plm_ft_dir
+            model_dir=cfg.plm_ft_dir,
+            gradient_accumulation_steps=args.accum_step
         )
         
         model_save_dir = cfg.plm_ft_dir
