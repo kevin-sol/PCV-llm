@@ -579,6 +579,16 @@ class LlamaPointCloudController:
         checkpoint_dir = os.path.join(model_dir, 'checkpoints')
         os.makedirs(best_model_dir, exist_ok=True)
         os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # 创建用于保存损失的目录
+        logs_dir = os.path.join(model_dir, 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        
+        # 创建损失日志文件
+        loss_log_path = os.path.join(logs_dir, 'loss_log.txt')
+        with open(loss_log_path, 'w') as f:
+            f.write("Episode,Loss,Reward,Quality,Rebuffer,Switch\n")  # 写入标题行
+        
         # 训练统计
         self.stats = {
         'episode_rewards': [],
@@ -770,6 +780,13 @@ class LlamaPointCloudController:
             self.stats['episode_qualities'].append(sum_quality)
             self.stats['episode_rebuffers'].append(sum_rebuffer)
             self.stats['episode_switch'].append(sum_switch)
+            
+            # 计算当前 episode 的平均损失
+            avg_loss = np.mean(self.stats['losses'][-1:]) if self.stats['losses'] else 0
+            
+            # 记录损失到文件
+            with open(loss_log_path, 'a') as f:
+                f.write(f"{episode},{avg_loss},{sum_reward},{sum_quality},{sum_rebuffer},{sum_switch}\n")
             
             # 报告训练进度
             if episode % report_interval == 0:

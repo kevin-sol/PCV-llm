@@ -96,7 +96,7 @@ def main():
     all_cooked_time=[]
     trace=[0,714, 486, 1196, 352, 1312, 1192, 1062, 97, 82, 847, 1198, 94, 892, 1040, 1349, 1204, 1054, 300, 614, 387, 386, 807, 1297, 909, 1453, 128, 683, 632, 271, 1265, 1226, 1364, 1420, 597, 1288, 132, 245, 744, 209, 1285]
     for startpos in range(1,41):
-        cooked_time, cooked_bw = load_data.load_trace(filename=cfg.trace_dirs['trace_5g']+'trace_5g.txt',startposition=startpos)
+        cooked_time, cooked_bw = load_data.load_trace(filename=cfg.trace_dirs['trace_5g']+'trace_5g.txt',startposition=trace[startpos])
         all_cooked_bw.append(cooked_bw)#Mbps
         all_cooked_time.append(cooked_time)
     #print(len(all_cooked_bw))
@@ -167,22 +167,6 @@ def main():
         
         model_dir_test = args.model_dir_test
         results_dir = cfg.results_dir
-        # # 如果存在保存的模型，加载它
-        # policy_path = os.path.join(model_dir_test, "policy_modules.pth")
-        # if os.path.exists(policy_path):
-        #     controller.policy.modules_except_plm.load_state_dict(
-        #         torch.load(policy_path, map_location=args.device)
-        #     )
-        #     print(f"加载保存的策略网络: {policy_path}")
-        
-        # # 如果使用了低秩适应且存在保存的PLM
-        # if args.rank != -1:
-        #     plm_path = os.path.join(model_dir_test, "pc_llama_adapted.pth")
-        #     if os.path.exists(plm_path):
-        #         controller.plm.load_state_dict(
-        #             torch.load(plm_path, map_location=args.device)
-        #         )
-        #         print(f"加载保存的PLM-LoRA: {plm_path}")
         controller.policy=load_model(args, controller.policy, model_dir_test)
         # 记录测试结果
         test_results = {
