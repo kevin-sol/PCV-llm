@@ -228,6 +228,16 @@ def main():
         print(f"平均重缓冲: {overall_avg_rebuffer:.2f}s")
         print(f"平均质量切换: {overall_avg_delay:.4f}")
         
+        # 保存测试结果
+        np.save(os.path.join(results_dir, "test_results.npy"), test_results)
+        
+        # 保存总体平均值到文本文件
+        with open(os.path.join(results_dir, "test_summary.txt"), 'w') as f:
+            f.write(f"Average Quality: {overall_avg_quality:.4f}\n")
+            f.write(f"Average Rebuffer: {overall_avg_rebuffer:.2f}s\n")
+            f.write(f"Average Delay: {overall_avg_delay:.4f}\n")
+        
+        print(f"测试完成，结果保存至 {results_dir}")
 
 if __name__ == '__main__':
     main()

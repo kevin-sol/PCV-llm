@@ -46,7 +46,9 @@ class LlamaPointCloudController:
         'eval_rebuffers': [],
         'eval_switch': [],
     }
-
+        # 计算状态维度
+        # state_dim = self._get_state_dim()
+        
         # 加载Llama-2-7B模型，支持模型并行
         self.plm, *_ = load_plm(
             args.plm_type, 
@@ -89,44 +91,27 @@ class LlamaPointCloudController:
         )
         
         # 创建优化器
-        # self.optimizer = AdamW(self.policy.modules_except_plm.parameters(), lr=args.lr,weight_decay=args.weight_decay)
         self.optimizer = AdamW(self.policy.parameters(), lr=args.lr,weight_decay=args.weight_decay)
-       
-        # 如果使用低秩适应，也包括这些参数
-        # if args.rank != -1:
-        #     self.optimizer.add_param_group({'params': self.plm.parameters()})
         
         # 初始化FOV历史缓冲区
         self.fov_history = []
+        self.dis_history = []
         self.history_length = 50  # 记录过去50帧的FOV
     
-    def _get_state_dim(self):
-        """计算状态维度"""
-        # 包括带宽特征、FOV历史、缓冲区信息等
-        bandwidth_dim = 10  # 当前和历史带宽
-        fov_history_dim = 50 * TILE_IN_F  # 50帧历史FOV
-        buffer_dim = 1 + TILE_IN_F  # 缓冲区大小和当前GOF状态
-        gof_size_dim = TILE_IN_F * QUALITY_LEVELS  # 下一个GOF的大小信息
-        frame_counter_dim = 1  # 视频帧计数器
-        
-        return bandwidth_dim + fov_history_dim + buffer_dim + gof_size_dim + frame_counter_dim
-    
-    def update_fov_history(self, current_fov):
+    def update_fov_history(self, user_fov_trace, user_dis_trace, current_frame):
         """更新FOV历史"""
-        self.fov_history.append(current_fov)
+        self.fov_history.append(user_fov_trace[current_frame])
         if len(self.fov_history) > self.history_length:
             self.fov_history.pop(0)
+        '''更新dis历史'''
+        self.dis_history.append(user_dis_trace[current_frame])
+        if len(self.dis_history) > self.history_length:
+            self.dis_history.pop(0)
     
     def preprocess_state(self):
-        """预处理环境状态为张量格式"""
+        """预处理环境状态为张量格式，只使用历史数据"""
         # 1. 带宽特征
         bandwidth_features = []
-        #形状1*3：[当前带宽，过去两个带宽]
-        # 当前带宽
-        # current_bw = self.env.cooked_bw[self.env.mahimahi_ptr]  # 当前带宽 
-        # bandwidth_features.append(current_bw / max(self.env.cooked_bw[self.env.mahimahi_ptr:self.env.mahimahi_ptr+10]))  # 归一化
-        
-        # 历史带宽
         ptr = self.env.mahimahi_ptr
         for i in range(3):  # 过去3个带宽样本
             if ptr > 0:
@@ -141,7 +126,6 @@ class LlamaPointCloudController:
         if len(self.fov_history) < self.history_length:
             padding_length = self.history_length - len(self.fov_history)
             fov_features.extend([1] * (padding_length * TILE_IN_F))
-            #fov_features.extend(self.fov_history[0])
             # 添加已有的历史
             for fov in self.fov_history:
                 fov_features.extend(fov)
@@ -153,7 +137,7 @@ class LlamaPointCloudController:
         # 3. 缓冲区特征
         buffer_features = []
         # 缓冲区大小
-        buffer_features.append(self.env.buffer_size )  # 秒
+        buffer_features.append(self.env.buffer_size)  # 秒
         
         # 当前GOF的缓冲区状态
         current_gof_index = self.env.video_frame_counter // F_IN_GOF
@@ -167,7 +151,7 @@ class LlamaPointCloudController:
                     buffer_features.append((quality + 1) / QUALITY_LEVELS)
         else:
             buffer_features.extend([0.0] * TILE_IN_F)
-        # buffer_features的形状应该是 [buffersize,12个质量等级]
+        
         # 4. 下一个GOF的大小信息
         gof_size_features = []
         next_frame = self.env.video_frame_counter
@@ -181,8 +165,7 @@ class LlamaPointCloudController:
                             tile_size += self.video_size[next_frame + frame][tile][quality]
                     
                     # 归一化大小
-                    gof_size_features.append(tile_size )  # 为Mb
-                    # gof_size_features形状12*4：[第一个tile的四个质量等级对应的size，第二个....]
+                    gof_size_features.append(tile_size)  # 为Mb
         else:
             # 已经是最后一个GOF，填充0
             gof_size_features.extend([0.0] * (TILE_IN_F * QUALITY_LEVELS))
@@ -190,150 +173,143 @@ class LlamaPointCloudController:
         # 5. 视频帧计数器
         frame_counter = [self.env.video_frame_counter / len(self.video_size)]  # 归一化
         
+        # 6. 历史距离信息 (与FOV历史同步)
+        dis_features = []
+        # 如果历史不足50帧，用1填充
+        if len(self.dis_history) < self.history_length:
+            padding_length = self.history_length - len(self.dis_history)
+            dis_features.extend([1.0] * (padding_length * TILE_IN_F))
+            # 添加已有的历史
+            for dis in self.dis_history:
+                dis_features.extend(dis)
+        else:
+            # 使用最近的50帧FOV
+            for dis in self.dis_history[-self.history_length:]:
+                dis_features.extend(dis)
+        
         # 组合所有特征
         state = np.concatenate([
             bandwidth_features,
             fov_features,
             buffer_features,
             gof_size_features,
-            frame_counter
+            frame_counter,
+            dis_features
         ])
-        #self.logger.info(f"state-shape: {state.shape}")
-        #return torch.FloatTensor(state).reshape(1, 1, -1)
+        
         return torch.FloatTensor(state).unsqueeze(0)
     
-    def predict_fov_and_bitrate(self, current_frame, playback_pos,user_fov_trace):
+    
+    def stream_next_gof(self, user_fov_trace, user_dis_trace, current_frame):
         """
-        使用Llama-2-7B预测FOV和比特率
+        流式传输下一个GOF，完全基于模型预测
         
         参数:
+            user_fov_trace: 用户FOV轨迹 (仅用于计算奖励，不用于决策)
+            user_dis_trace: 用户距离轨迹 (仅用于计算奖励，不用于决策)
             current_frame: 当前帧索引
-            playback_position: 当前播放位置（已知FOV的最后一帧）
-            user_fov_trace: 用户FOV轨迹
-            
+                
         返回:
-            selected_tile: 选择的tile
-            selected_quality: 选择的质量级别
+            延迟、重缓冲时间、质量等指标
         """
-        # 根据播放位置更新FOV历史（只使用已经播放过的帧的FOV）
-        self.fov_history = []  # 清空历史
-        for i in range(max(0, playback_pos - self.history_length), playback_pos):
+        # 更新FOV历史
+        self.playback_pos = int(self.env.playback_position)
+        self.fov_history = []
+        self.dis_history = []
+        for i in range(max(0, self.playback_pos - self.history_length), self.playback_pos):
             if i < len(user_fov_trace):
                 self.fov_history.append(user_fov_trace[i])
-    
-        # 如果没有足够的历史FOV，使用默认策略
-        if len(self.fov_history) < 50:  # 至少需要50帧历史
-            selected_tile = np.ones(TILE_IN_F)  # 保守策略：选择所有tile
-            selected_quality = np.zeros(TILE_IN_F, dtype=int)  # 默认最低质量
-            return selected_tile, selected_quality
+                self.dis_history.append(user_dis_trace[i])
         
-        # 预处理当前状态（只基于已知的FOV历史）
+        # 准备环境状态
         state = self.preprocess_state()
-        #此时state的shape是[1,665]
-
-        # 使用策略网络预测动作
+        
+        # 使用策略网络直接预测质量级别
         with torch.no_grad():
-            # 计算理论最优回报
-            quality = 0
-            for i in range(F_IN_GOF):
-                for j in range(TILE_IN_F):
-                    quality+=self.video_size[0+i][j][3]
-            max_quality_reward = INIT_QOE * quality  # 最高质量奖励
-            min_rebuffer = 0  # 理想情况无重缓冲
-            min_switch = 0  # 理想情况无质量切换
-            #target_return = max_quality_reward - min_rebuffer - min_switch
-            
             # 计算目标回报
             if len(self.stats['episode_rewards']) > 0:
-                # 使用历史最佳回报作为目标
                 best_reward = max(self.stats['episode_rewards'])
-                # 或使用最近N个episode的平均回报
                 recent_avg = np.mean(self.stats['episode_rewards'][-10:])
-                # 设置稍高于当前表现的目标
                 target_return = max(best_reward, recent_avg) * 1.1
             else:
-                # 初始阶段使用一个合理的估计值
-                target_return = max_quality_reward   # 假设理想情况下每个GOF都能获得最高质量
+                # 初始估计
+                quality_sum = 0
+                for i in range(F_IN_GOF):
+                    for j in range(TILE_IN_F):
+                        quality_sum += self.video_size[0+i][j][3]
+                target_return = INIT_QOE * quality_sum
             
-            # 当前时间步（归一化）
+            # 当前时间步
             timestep = self.env.video_frame_counter // F_IN_GOF
             
-            # 采样动作
-            selected_tile, selected_quality = self.policy.sample(
+            # 获取质量级别决策
+            selected_tile,quality_levels = self.policy.sample(
                 state=state,
                 target_return=target_return,
                 timestep=timestep
             )
+        # self.logger.info(f"tile:{selected_tile},quality:{quality_levels}")
+        # 执行下载
+        delay, sleep_time, buffer_size, rebuffer, gof_size, done, gof_remain, buffer = \
+            self.env.get_video_gof(selected_tile, quality_levels)
         
-        return selected_tile, selected_quality
-    
-    def stream_next_gof(self, user_fov_trace,user_dis_trace ,current_frame):
+        # 仅用于评估 - 计算实际FOV中的tiles
+        seen = [0] * TILE_IN_F
+        for i in range(TILE_IN_F):
+            for f in range(current_frame, min(current_frame + F_IN_GOF, len(user_fov_trace))):
+                if f < len(user_fov_trace) and user_fov_trace[f][i]:
+                    seen[i] = 1
+                    break
+        
+        # 计算平均质量
+        quality = 0
+        for i in range(F_IN_GOF):
+            frame_idx = min(current_frame + i, len(self.video_size) - 1)
+            for j in range(TILE_IN_F):
+                if seen[j] and selected_tile[j]:
+                    dis_idx = min(frame_idx, len(user_dis_trace) - 1)
+                    quality += self.video_size[frame_idx][j][quality_levels[j]] / user_dis_trace[dis_idx][j]
+        
+        # 计算切换量
+        switch = 0.0
+        if current_frame > 0:
+            for s in range(TILE_IN_F):
+                if selected_tile[s]:
+                    prev_quality = max(0, buffer[current_frame//F_IN_GOF-1][s])
+                    switch += np.abs(
+                        MULTIPLE_QUALITY_LEVELS[quality_levels[s]] - 
+                        MULTIPLE_QUALITY_LEVELS[prev_quality]
+                    )
+        return delay, rebuffer, quality, switch, selected_tile, quality_levels, buffer
+        
+    def prepare_gof_fov_targets(self,user_fov_trace, current_frame, gof_length=F_IN_GOF):
         """
-        流式传输下一个GOF
+        准备GOF内每一帧的FOV目标
         
         参数:
             user_fov_trace: 用户FOV轨迹
             current_frame: 当前帧索引
+            gof_length: GOF长度
             
         返回:
-            delay: 延迟
-            rebuffer: 重缓冲时间
-            quality: 平均质量
+            gof_fov_targets: 形状为[tile_num, gof_length]的数组，表示每个tile在每一帧中的FOV状态
         """
-        self.playback_pos=int(self.env.playback_position)
-        # self.logger.info(f"播放位置：{self.playback_pos}")
-        # 使用Llama-2-7B预测tile选择和质量级别
-        selected_tile, selected_quality = self.predict_fov_and_bitrate(
-            current_frame, 
-            self.playback_pos,
-            user_fov_trace
-        )
-        self.logger.info(f"selected_tile:{selected_tile},selected_quality:{selected_quality}")
-        # 执行下载
-        delay, sleep_time, buffer_size, rebuffer, gof_size, done, gof_remain, buffer = \
-            self.env.get_video_gof(selected_tile, selected_quality)
-                
-        # 计算平均质量
-        seen = [0]*TILE_IN_F
-        quality = 0
-        #在真实fov中只要当前gof中有一帧的tile i为1，seen[i]=1
-        for i in range(TILE_IN_F):
-            for f in range(current_frame,current_frame+F_IN_GOF):
-                if user_fov_trace[f][i]:
-                    seen[i]=1
-                    break
-        for i in range(F_IN_GOF):
-            for j in range(TILE_IN_F):
-                if seen[j]*selected_tile[j]:
-                    quality+=self.video_size[current_frame+i][j][selected_quality[j]]/user_dis_trace[current_frame+i][j]
-        # 计算switch
-        switch=0.0
-        if(current_frame>0):
-            for s in range(TILE_IN_F):
-                switch+= \
-                    np.abs(MULTIPLE_QUALITY_LEVELS[selected_quality[s]] \
-                        -MULTIPLE_QUALITY_LEVELS[max(0,buffer[current_frame//F_IN_GOF-1][s])])
-        return delay , rebuffer , quality,switch, selected_tile, selected_quality ,buffer # 为秒 
-    
-    
-    def evaluate(self, fov_traces,dis_traces, num_traces=5):
-        """
-        评估模型在测试数据上的性能
+        # 初始化目标数组
+        gof_fov_targets = np.zeros((TILE_IN_F, gof_length))
         
-        参数:
-            fov_traces: FOV轨迹集合
-            num_traces: 用于评估的轨迹数量
-            
-        返回:
-            avg_reward: 平均回报
-            avg_quality: 平均质量
-            avg_rebuffer: 平均重缓冲时间
-        """
-        # 保存当前模型参数，以便评估后恢复
-        # policy_state = {k: v.clone() for k, v in self.policy.modules_except_plm.state_dict().items()}
-        # if self.args.rank != -1:
-        #     plm_state = {k: v.clone() for k, v in self.plm.state_dict().items()}
+        # 填充可用的FOV数据
+        for i in range(gof_length):
+            frame_idx = current_frame + i
+            if frame_idx < len(user_fov_trace):
+                for tile in range(TILE_IN_F):
+                    gof_fov_targets[tile, i] = user_fov_trace[frame_idx][tile]
         
+        return gof_fov_targets    
+        
+    def evaluate(self, fov_traces, dis_traces, num_traces=5):
+        """
+        评估模型性能，不使用真实FOV
+        """
         # 保存当前训练状态
         training_policy = self.policy.modules_except_plm.training
         training_plm = self.plm.training if self.args.rank != -1 else False
@@ -348,12 +324,15 @@ class LlamaPointCloudController:
         all_qualities = []
         all_rebuffers = []
         all_switches = []
+        
         # 限制评估轨迹数量
         eval_trace_indices = np.random.choice(len(fov_traces), min(num_traces, len(fov_traces)), replace=False)
+        
         with torch.no_grad():
             for trace_idx in eval_trace_indices:
                 user_fov_trace = fov_traces[trace_idx]
                 user_dis_trace = dis_traces[trace_idx]
+                
                 # 重置环境和历史
                 self.env.reset()
                 self.fov_history = []
@@ -365,40 +344,27 @@ class LlamaPointCloudController:
                 trace_rebuffer = []
                 trace_switch = []
                 
-                # 每个 gof 内所有帧使用相同的质量决策，所以这里保存上一 gof 的质量信息
-                prev_quality = [0]*TILE_IN_F
-                
-                # 模拟视频播放（以 gof 为单位）
+                # 模拟视频播放
                 current_frame = 0
                 
                 while current_frame < len(self.video_size):
-                    delay, rebuffer, quality,switch, selected_tile, selected_quality ,buffer= self.stream_next_gof(
+                    delay, rebuffer, quality, switch, selected_tile, selected_quality, buffer = self.stream_next_gof(
                         user_fov_trace, 
                         user_dis_trace,
                         current_frame
                     )
                     
-                    # 计算 tile 级别的质量切换惩罚（按 gof 为单位）
-                    # 这里 selected_quality 表示当前 gof 内每个 tile 的质量（均相同于该 gof 的决策）
-                    switch_penalty = 0.0
-                    for s in range(TILE_IN_F):
-                        # 如果该 tile 被选择（例如 selected_tile[s] > 0.1 表示该 tile 有效）
-                        switch_penalty+=SMOOTH_PENALTY *\
-                            np.abs(MULTIPLE_QUALITY_LEVELS[max(buffer[current_frame//F_IN_GOF][s],0)]-MULTIPLE_QUALITY_LEVELS[prev_quality[s]])
-            
-                    # 计算质量奖励和重缓冲惩罚
+                    # 计算奖励和惩罚
                     quality_reward = quality * INIT_QOE
                     rebuffer_penalty = rebuffer * REBUF_PENALTY
+                    switch_penalty = switch * SMOOTH_PENALTY
                     reward = quality_reward - rebuffer_penalty - switch_penalty
                     
                     # 更新统计
-                    # 一个视频中每一个gof的
                     trace_qualities.append(quality)
                     trace_rebuffer.append(rebuffer)
-                    trace_switch.append(switch_penalty/SMOOTH_PENALTY)
+                    trace_switch.append(switch)
                     trace_reward.append(reward)
-                    # 更新上一帧的质量向量
-                    prev_quality = selected_quality
                     
                     # 更新当前帧
                     current_frame += F_IN_GOF
@@ -407,7 +373,6 @@ class LlamaPointCloudController:
                         break
                 
                 # 记录轨迹结果
-                # 平均每个视频的
                 all_rewards.append(np.sum(trace_reward))
                 all_qualities.append(np.sum(trace_qualities) if trace_qualities else 0)
                 all_rebuffers.append(np.sum(trace_rebuffer))
@@ -418,28 +383,25 @@ class LlamaPointCloudController:
             self.policy.modules_except_plm.train()
         if self.args.rank != -1 and training_plm:
             self.plm.train()
+            
         # 清理内存
         torch.cuda.empty_cache()
-        # 恢复模型参数
-        # self.policy.modules_except_plm.load_state_dict(policy_state)
-        # if self.args.rank != -1:
-        #     self.plm.load_state_dict(plm_state)
         
         # 计算平均值
-        # 测试的几个trace，平均每个trace
         avg_reward = np.mean(all_rewards)
         avg_quality = np.mean(all_qualities)
         avg_rebuffer = np.mean(all_rebuffers)
         avg_switch = np.mean(all_switches)
-        return avg_reward, avg_quality, avg_rebuffer,avg_switch
-    
-    def train_step(self, states, actions, returns, timesteps, weights=None, update_params=True):
+        
+        return avg_reward, avg_quality, avg_rebuffer, avg_switch
+
+    def train_step(self, states, actions, returns, timesteps, target_fovs, weights=None, update_params=True):
         """
-        执行一个训练步骤
+        执行一个训练步骤 - 修改为只处理质量级别预测
         
         参数:
             states: 状态批次
-            actions: 动作批次（包含tile选择和质量级别）
+            actions: 动作批次（每个tile的质量级别）
             returns: 回报批次
             timesteps: 时间步批次
             weights: 样本权重，用于优先级经验回放
@@ -453,72 +415,71 @@ class LlamaPointCloudController:
         if update_params:
             self.optimizer.zero_grad()
         
-        # 从策略网络获取预测
-        #self.logger.info(f"train-step shape:{states.shape}")
-        tile_selection_pred, quality_pred = self.policy(
+        # 从策略网络获取预测 - 现在只预测质量级别
+        fov_pred,quality_pred = self.policy(
             states=states,
             actions=actions,
             returns=returns,
             timesteps=timesteps
         )
+        # 计算FOV预测损失（二元交叉熵）
+        batch_size, seq_len = states.shape[0], states.shape[1]
+        # 重塑target_fovs以匹配fov_pred的形状
+        fov_loss=0
+        target_fovs_reshaped = target_fovs.view(batch_size * seq_len, TILE_IN_F, F_IN_GOF)
         
-        # 分离true标签
-        tile_selection_true = actions[:, :, :TILE_IN_F]
-        quality_true = actions[:, :, TILE_IN_F:]
+        # 计算每个样本的FOV损失
+        for i in range(batch_size * seq_len):
+            sample_fov_loss = F.binary_cross_entropy_with_logits(
+                fov_pred[i], target_fovs_reshaped[i]
+            )
+            
+            # 应用样本权重（如果提供）
+            if weights is not None:
+                sample_idx = i // seq_len  # 确定样本在批次中的索引
+                sample_fov_loss = sample_fov_loss * weights[sample_idx]
+            
+            fov_loss += sample_fov_loss
         
-        # 计算tile选择损失（二进制交叉熵）
-        tile_loss = F.binary_cross_entropy_with_logits(
-            tile_selection_pred,
-            tile_selection_true
-        )
+        # fov_loss = fov_loss / (batch_size * seq_len)
         
-        # 如果提供了权重，应用于损失函数
-        if weights is not None:
-            tile_loss = tile_loss * weights.view(-1, 1, 1)
-        
-        # 取平均
-        tile_loss = tile_loss.mean()
-        
-        batch_size, seq_len, _ = tile_selection_true.shape
-        # quality_true形状是1，10，12 batchsize,seqlen,tile 归一化质量级别
-        # quality_pred形状是10，12，4 seqlen,tile,quality 概率
         # 计算质量级别损失
+        batch_size, seq_len, _ = actions.shape
         quality_loss = 0
         quality_samples = 0
-        quality_errors = []  # 存储每个样本的质量误差
+        
         for b in range(batch_size):
             for s in range(seq_len):
                 for t in range(TILE_IN_F):
-                    if tile_selection_true[b, s, t] > 0.1:
-                        # 将归一化的质量值转换为类别索引
-                        target_quality = (quality_true[b, s, t] * (QUALITY_LEVELS- 1)).round().long()
-                        
-                        # 计算交叉熵损失
-                        sample_loss = F.cross_entropy(
-                            quality_pred[s, t].unsqueeze(0),
-                            target_quality.unsqueeze(0),
-                            reduction='none'
-                        )
-                        
-                        # 如果提供了权重，应用于损失
-                        if weights is not None:
-                            sample_loss = sample_loss * weights[b]
-                        
-                        quality_loss += sample_loss
-                        quality_samples += 1
-                        quality_errors.append(sample_loss.item())
-
+                    # 将归一化的质量值转换为类别索引
+                    target_quality = (actions[b, s, t] * (QUALITY_LEVELS - 1)).round().long()
+                    
+                    # 计算交叉熵损失
+                    sample_loss = F.cross_entropy(
+                        quality_pred[s, t].unsqueeze(0),
+                        target_quality.unsqueeze(0),
+                        reduction='none'
+                    )
+                    
+                    # 如果提供了权重，应用于损失
+                    if weights is not None:
+                        sample_loss = sample_loss * weights[b]
+                    
+                    quality_loss += sample_loss
+                    quality_samples += 1
         
         if quality_samples > 0:
             quality_loss = quality_loss / quality_samples
         else:
             print("警告: 没有有效的质量样本")
-            quality_loss = torch.tensor(0.0, device=tile_loss.device)
-        # 总损失
-        loss = tile_loss + quality_loss
+            quality_loss = torch.tensor(0.0, device=quality_pred.device)
+        
+        # 总损失（现在只有质量损失）
+        loss = quality_loss+fov_loss
+        
         # 计算TD误差（用于优先级更新）
         with torch.no_grad():
-            # 简单地使用总损失作为TD误差的代理
+            # 使用总损失作为TD误差的代理
             td_errors = torch.abs(loss) * torch.ones(batch_size, device=loss.device)
         
         # 反向传播
@@ -535,7 +496,7 @@ class LlamaPointCloudController:
             # 更新参数
             self.optimizer.step()
         
-        return loss ,td_errors
+        return loss, td_errors
     
     def train(self, fov_traces,dis_traces, num_episodes=3000, batch_size=1, report_interval=10, 
           eval_interval=200, save_interval=200, model_dir=cfg.plm_ft_dir, gradient_accumulation_steps=4):
@@ -572,16 +533,16 @@ class LlamaPointCloudController:
         
         # 训练统计
         self.stats = {
-            'episode_rewards': [],
-            'episode_qualities': [],
-            'episode_rebuffers': [],
-            'episode_switch': [],
-            'losses': [],
-            'eval_rewards': [],
-            'eval_qualities': [],
-            'eval_rebuffers': [],
-            'eval_switch': [],
-        }
+        'episode_rewards': [],
+        'episode_qualities': [],
+        'episode_rebuffers': [],
+        'episode_switch': [],
+        'losses': [],
+        'eval_rewards': [],
+        'eval_qualities': [],
+        'eval_rebuffers': [],
+        'eval_switch': [],
+    }
         # 记录最佳模型性能
         best_eval_reward = float('-inf')
         # 使用优先级经验回放缓冲区
@@ -590,13 +551,12 @@ class LlamaPointCloudController:
         optimization_step = 0
 
         for episode in range(num_episodes):
-             # 每个 episode 的统计数据（汇总所有 FOV 轨迹）
+            # 每个 episode 的统计数据（汇总所有 FOV 轨迹）
             episode_rewards_all = []
             episode_qualities_all = []
             episode_rebuffers_all = []
             episode_switches_all = []
             epoch_losses = []
-            
             # 遍历所有FOV轨迹
             for fov_trace_idx in range(len(fov_traces)):
                 user_fov_trace = fov_traces[fov_trace_idx]
@@ -626,24 +586,16 @@ class LlamaPointCloudController:
                 while current_frame < len(self.video_size):
                     # 获取当前状态
                     state = self.preprocess_state()
-                    #self.logger.info(f'train.shape: {state.shape}')
                     episode_states.append(state)
-                    #记录当前帧
-                    #self.logger.info(f'当前帧: {current_frame}')
                     # 流式传输下一个GOF
                     delay, rebuffer, quality, switch, selected_tile, selected_quality,buffer = self.stream_next_gof(
                         user_fov_trace, 
                         user_dis_trace,
                         current_frame
                     )
-                    
                     # 构造动作向量
                     # 将 selected_quality 转换为 NumPy 数组后再进行除法操作
-                    action = np.concatenate([
-                        selected_tile, 
-                        np.array(selected_quality, dtype=np.float32) / (QUALITY_LEVELS - 1)
-                    ])
-                    #action = np.concatenate([selected_tile, selected_quality / (QUALITY_LEVELS - 1)])
+                    action = np.array(selected_quality, dtype=np.float32) / (QUALITY_LEVELS - 1)
                     episode_actions.append(action)
                     
                     # 计算回报
@@ -673,11 +625,19 @@ class LlamaPointCloudController:
                         break
                 
                 # 收集本情节的经验到缓冲区
-                experience=(
+                target_fovs_list = []
+                for frame_idx in range(len(episode_timesteps)):
+                    current_frame = frame_idx*F_IN_GOF
+                    gof_fov_targets = self.prepare_gof_fov_targets(user_fov_trace, current_frame)
+                    target_fovs_list.append(gof_fov_targets)
+
+                # 将经验添加到缓冲区
+                experience = (
                     torch.cat(episode_states, dim=0),
                     torch.tensor(episode_actions, dtype=torch.float32),
                     torch.tensor(episode_returns, dtype=torch.float32).unsqueeze(1),
-                    torch.tensor(episode_timesteps, dtype=torch.int32)
+                    torch.tensor(episode_timesteps, dtype=torch.int32),
+                    torch.tensor(target_fovs_list, dtype=torch.float32)  # [seq_len, tile_num, F_IN_GOF]
                 )
                 # 使用平均回报作为初始优先级
                 initial_priority = abs(np.mean(episode_returns)) + 1e-5
@@ -705,7 +665,7 @@ class LlamaPointCloudController:
                             mini_batch_weights = batch_weights[i:end_idx]
                             
                             # 解包小批量
-                            batch_states, batch_actions, batch_returns, batch_timesteps = zip(*mini_batch)
+                            batch_states, batch_actions, batch_returns, batch_timesteps,batch_target_fovs = zip(*mini_batch)
                             
                             # 执行训练步骤但不更新参数
                             loss, td_errors = self.train_step(
@@ -713,6 +673,7 @@ class LlamaPointCloudController:
                                 actions=torch.stack(batch_actions).to(self.device),
                                 returns=torch.stack(batch_returns).to(self.device),
                                 timesteps=torch.stack(batch_timesteps).to(self.device),
+                                target_fovs=torch.stack(batch_target_fovs).to(self.device),
                                 weights=torch.tensor(mini_batch_weights, dtype=torch.float32).to(self.device),
                                 update_params=False  # 不立即更新参数
                             )
@@ -736,33 +697,35 @@ class LlamaPointCloudController:
                         
                         self.optimizer.step()
                         optimization_step += 1
-                         # 记录每批次的平均损失
+                        
+                        # 记录平均损失
                         avg_batch_loss = accumulated_loss / gradient_accumulation_steps
                         epoch_losses.append(avg_batch_loss)
                         self.stats['losses'].append(avg_batch_loss)
-                        
+                            
                 # 计算每个视频的gof总和
                 sum_reward = np.sum(episode_reward)
-                sum_quality = np.sum(episode_qualities) 
+                sum_quality = np.sum(episode_qualities) if episode_qualities else 0
                 sum_rebuffer = np.sum(episode_rebuffers)
                 sum_switch = np.sum(episode_switch)
-                
+
                 episode_rewards_all.append(sum_reward)
                 episode_qualities_all.append(sum_quality)
                 episode_rebuffers_all.append(sum_rebuffer)
                 episode_switches_all.append(sum_switch)
-            
             # for循环结束
             avg_epoch_reward = np.mean(episode_rewards_all)
             avg_epoch_quality = np.mean(episode_qualities_all)
             avg_epoch_rebuffer = np.mean(episode_rebuffers_all)
             avg_epoch_switch = np.mean(episode_switches_all)
             avg_epoch_loss = np.mean(epoch_losses) 
+            
             # 存储统计信息到全局统计
             self.stats['episode_rewards'].append(avg_epoch_reward)
             self.stats['episode_qualities'].append(avg_epoch_quality)
             self.stats['episode_rebuffers'].append(avg_epoch_rebuffer)
             self.stats['episode_switch'].append(avg_epoch_switch)
+                      
             # 记录损失到文件
             with open(loss_log_path, 'a') as f:
                 f.write(f"{episode},{avg_epoch_loss:.8f},{avg_epoch_reward:.2f},{avg_epoch_quality:.2f},{avg_epoch_rebuffer:.4f},{avg_epoch_switch:.4f}\n")
@@ -775,7 +738,7 @@ class LlamaPointCloudController:
                     f"Avg Rebuffer: {avg_epoch_rebuffer:.4f}s | "
                     f"Avg Switch: {avg_epoch_switch:.4f} | "
                     f"Avg Loss: {avg_epoch_loss:.6f}")
-                
+            
             # 每隔save_interval保存模型检查点
             if episode % save_interval == 0 and episode > 0:
                 checkpoint_path = os.path.join(checkpoint_dir, f"model_ep_{episode}")
@@ -785,17 +748,17 @@ class LlamaPointCloudController:
             # 每隔eval_interval评估模型
             if episode % eval_interval == 0 and episode > 0:
                 print(f"\n开始第 {episode} 轮评估...")
-                eval_reward, eval_quality, eval_rebuffer, eval_switch = self.evaluate(fov_traces, dis_traces)
+                eval_reward, eval_quality, eval_rebuffer, eval_switch= self.evaluate(fov_traces,dis_traces)
 
                 # 记录评估结果
                 self.stats['eval_rewards'].append(eval_reward)
                 self.stats['eval_qualities'].append(eval_quality)
                 self.stats['eval_rebuffers'].append(eval_rebuffer)
-                self.stats['eval_switch'].append(eval_switch)
+                self.stats['episode_switch'].append(eval_switch)
                 print(f"以整个视频为单位的评估结果:")
                 print(f"平均回报: {eval_reward:.4f}, "
                         f"平均质量: {eval_quality:.4f}, "
-                        f"平均重缓冲: {eval_rebuffer:.4f}s, "
+                        f"平均重缓冲: {eval_rebuffer:.4f}s,"
                         f"平均切换: {eval_switch:.4f}")
                 # 如果当前模型性能更好，保存为最佳模型
                 if eval_reward > best_eval_reward:
@@ -803,7 +766,6 @@ class LlamaPointCloudController:
                     save_model(self.args, self.policy, best_model_dir)
                     print(f"新的最佳模型已保存: {best_model_dir}")
                 print("")
-                
         # 训练结束，保存最终模型
         final_model_path = os.path.join(model_dir, "final_model")
         save_model(self.args, self.policy, final_model_path)

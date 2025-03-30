@@ -1,7 +1,6 @@
 
 3.controller
 
-
 梯度裁剪
 目前针对 self.policy.modules_except_plm.parameters() 和低秩适应模块参数分别进行了梯度裁剪。
 建议根据实际训练表现对裁剪阈值（这里设为 1.0）进行调优，确保训练过程更加稳定。
@@ -16,5 +15,21 @@ stacked_inputs = stacked_inputs[:, -self.plm_embed_size:, :]
 建议确认是否真的希望用 PLM 的嵌入维度作为序列长度截断参数，如果是序列长度限制，
 通常应采用专门的 max_seq_length 参数。
 
-5.env_pcv
-play_pos问题
+维度和截断问题：检查 stacked_inputs 截断 [:, -self.plm_embed_size:, :] 是否严格符合预训练语言模型输入的要求，不同 PLM 对输入长度可能要求不一。
+随机探索参数：比如 epsilon 衰减、tile 选择的阈值和数量保证的逻辑，可能需要根据实际网络环境和实验数据进一步调整。
+
+env_pcv:
+    play_pos的问题
+
+数据集问题：
+    10秒不太够
+
+超参数调优：
+    学习率: 尝试范围 [1e-5, 5e-5, 1e-4, 5e-4]
+    LoRA 秩: 尝试 [16, 32, 64, 128]
+    梯度累积步数: 根据显存限制调整
+
+训练epoch：
+    现在一个epoch是随机挑选一个fov轨迹训练
+    应该修改成一个epoch训练三十个fov轨迹
+    还有试着加入带宽，现在的带宽也是随机选择的
